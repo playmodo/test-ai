@@ -581,8 +581,8 @@ while _turbo_index < len(TURBO_PROFILES):
     _turbo_timed_out = False
     for command in _turbo_setup_commands:
         print(f"taaf.kaggle: setup command: {command}", flush=True)
-        _turbo_rc, _turbo_timed_out = _turbo_run_setup(command, env,
-                                                       max(60.0, _turbo_limit - (time.monotonic() - _turbo_t0)))
+        _turbo_rc, _turbo_timed_out = _turbo_run_setup(
+            command, env, max(min(60.0, _turbo_limit), _turbo_limit - (time.monotonic() - _turbo_t0)))
         # Re-read in case the command persisted new env keys.
         env = _command_env()
         os.environ.update(env)
