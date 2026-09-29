@@ -425,10 +425,12 @@ def _turbo_load_phase(profile: dict, model: str, image_part, tokens_per_line: fl
             results.append(("ok", int(usage.get("prompt_tokens") or 0)))
         except _urlerr.HTTPError as exc:
             results.append((f"http{exc.code}", 0))
-            print(f"TURBO_LIVE_LOAD request {k} HTTP {exc.code}: {exc.read()[:200]!r}", flush=True)
+            if sum(1 for status, _ in results if status != "ok") <= 3:
+                print(f"TURBO_LIVE_LOAD request {k} HTTP {exc.code}: {exc.read()[:200]!r}", flush=True)
         except Exception as exc:
             results.append(("error", 0))
-            print(f"TURBO_LIVE_LOAD request {k} failed: {exc!r}"[:300], flush=True)
+            if sum(1 for status, _ in results if status != "ok") <= 3:
+                print(f"TURBO_LIVE_LOAD request {k} failed: {exc!r}"[:300], flush=True)
 
     started = time.monotonic()
     preempted_before = _turbo_metric("vllm:num_preemptions")

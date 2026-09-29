@@ -162,12 +162,17 @@ Các biến môi trường để thử nghiệm (đặt ở đầu cell 3):
 - `tools/cpu_mock/`: dựng cây `/kaggle` giả để chạy **nguyên notebook** trên CPU với LLM giả.
   - `mock_serving_setup.py` import `serving_setup.py` **thật** để validate mọi biến `TAAF_VLLM_*` và in đúng argv vLLM.
   - Chạy với 25 game public offline (arc-agi 0.9.8 / arcengine 0.9.3) và bộ chấm điểm thật.
-- **Các kịch bản đã chạy đạt:**
-  - Profile đầu chạy bình thường.
-  - Profile 1 lỗi setup và để lại **tiến trình mồ côi giữ cổng 1234**; profile 2 lỗi **OOM** → mồ côi bị kill,
-    profile 3 (7 GiB) thắng.
-  - Prefix cache "hỏng" (trả lời sai ở đường cache-hit), rồi profile 2 lỗi không phải OOM → nhảy thẳng về profile MTP-3,
-    nhiệt độ tự về 0.6.
+- **Các kịch bản đã chạy đạt** (`tools/cpu_mock/run_scenarios.sh`, mỗi kịch bản chạy trọn notebook rồi `check_turbo_run.py`):
+  - **A**: profile prefix qua kiểm tra ngắn + **pha quá tải 20/20** (đúng sampling 1.0/0.95/20) + câu cold sau khi evict.
+    Sau đó **vLLM giả chết giữa run** → watchdog phát hiện sau ~60 s, restart với **prefix tắt**
+    (`TURBO_WATCHDOG_RESTART_NO_PREFIX`, `restart_complete`) → 529 request game được server mới phục vụ, không cell nào lỗi.
+  - **B**: pha quá tải trả HTTP 500 → loại profile prefix → profile 10 GiB không prefix.
+  - **C**: profile 0 lỗi **OOM**, profile 1 lỗi thường → nhảy về MTP-3 (s16), nhiệt độ tự về 0.6. Kiểm tra được rằng
+    OOM của lần 0 không "rò" sang quyết định của lần 1 (bản trước sẽ đi nhầm sang 7 GiB).
+  - **D**: setup **bị treo** → hết giới hạn lần thử → nhảy thẳng về MTP-3.
+  - **E**: setup lỗi và để lại **tiến trình mồ côi giữ cổng 1234** → bị kill → profile kế tiếp lên.
+  - **F**: prefix cache "hỏng" (trả lời sai ở đường cache-hit) → loại profile prefix.
+  - Bộ phân loại OOM: kiểm thử đơn vị trên log 09-22 khoẻ mạnh (không bị coi là OOM) và các dạng OOM thật.
   - Hợp đồng watchdog (argv dựng lại khớp argv đang chạy) được kiểm tra với file identity thật.
   - **Diễn tập nhánh nộp bài thật** (`--competition`): gateway giả chế độ competition với 110 game, 1 scorecard,
     ngân sách thu nhỏ; kiểm tra keepalive, wave-fit, ngân sách động mỗi game, soft end và teardown.
@@ -182,9 +187,11 @@ Lệnh tái lập:
 ```
 python tools/build_turbo_notebook.py
 python tools/cpu_mock/build_fake_kaggle.py --duck-src <Tufalabs/duck-harness> --bundle-ref <bundle dir> --env-files <environment_files>
-cd /kaggle/working && python tools/cpu_mock/run_notebook_cpu.py notebooks/arc3-flashnext-turbo.ipynb --out /tmp/x.ipynb --runtime-s 150 \
-    --env MOCK_LOG=/tmp/req.jsonl --env TURBO_RELEASE_MIN_MEM_GIB=0 [--env MOCK_FAIL_SETUP_SEQS=16] [--env MOCK_CORRUPT_WARM=16]
-python tools/cpu_mock/check_turbo_run.py /tmp/x.ipynb /tmp/req.jsonl
+tools/cpu_mock/run_scenarios.sh all          # A-F ở trên
+python tools/cpu_mock/run_notebook_cpu.py notebooks/arc3-flashnext-turbo.ipynb --out /tmp/c.ipynb --competition \
+    --competition-run-s 720 --taaf-src <duck-harness>/tufa-arc-agi-framework/src \
+    --env-files /kaggle/input/competitions/arc-prize-2026-arc-agi-3/environment_files \
+    --env MOCK_LOG=/tmp/c.jsonl --env TURBO_BUDGET_FLOOR_S=60 --env TURBO_BUDGET_RESERVE_S=30 --env TURBO_RELEASE_MIN_MEM_GIB=0
 ```
 
 ## 7. Bước tiếp theo (A/B, theo thứ tự nên thử)
