@@ -177,6 +177,17 @@ def _install_analyze_guard(ta_mod, rep: dict) -> None:
     orig = TA.analyze
     Result = ta_mod.AnalyzerTurnResult
 
+    def _wait(kwargs, seconds: float) -> None:
+        should_stop = kwargs.get("should_stop")
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                if should_stop is not None and should_stop():
+                    return
+            except Exception:
+                return
+            time.sleep(1.0)
+
     def analyze(self, *args, **kwargs):
         error = None
         try:
@@ -185,6 +196,20 @@ def _install_analyze_guard(ta_mod, rep: dict) -> None:
             result, error = None, exc
         if result is not None:
             self._turbo_failures = 0
+            if getattr(result, "retryable_failure", False):
+                # request errors (server down / restarting / timeouts): the stock solver retries every 1 s forever,
+                # each retry re-writing the transcript; back off 2, 4, ... 30 s after the third in a row
+                streak = int(getattr(self, "_turbo_request_failures", 0) or 0) + 1
+                self._turbo_request_failures = streak
+                if streak >= 3:
+                    if streak == 3 or streak % 20 == 0:
+                        try:
+                            print(f"TURBO_REQUEST_BACKOFF streak={streak}", flush=True)
+                        except Exception:
+                            pass
+                    _wait(kwargs, min(30.0, 2.0 ** (streak - 2)))
+            else:
+                self._turbo_request_failures = 0
             return result
         failures = int(getattr(self, "_turbo_failures", 0) or 0) + 1
         self._turbo_failures = failures
@@ -192,19 +217,11 @@ def _install_analyze_guard(ta_mod, rep: dict) -> None:
             print(f"TURBO_ANALYZE_GUARD failure={failures}/{max_failures} error={error!r}"[:400], flush=True)
         except Exception:
             pass
-        if failures > max_failures:
+        if failures > max_failures:  # let the game end (frees its lane for an unstarted game)
             if error is not None:
                 raise error
             return None
-        should_stop = kwargs.get("should_stop")
-        deadline = time.monotonic() + min(30.0, 5.0 * failures)
-        while time.monotonic() < deadline:
-            try:
-                if should_stop is not None and should_stop():
-                    break
-            except Exception:
-                break
-            time.sleep(1.0)
+        _wait(kwargs, min(30.0, 5.0 * failures))
         return Result(step_executed=False, retryable_failure=True)
 
     TA.analyze = analyze
@@ -431,8 +448,10 @@ _BUDGET = {"total": None, "lanes": 1, "reserve": 180.0, "floor": 600.0, "cap": N
 _BUDGET_LOCK = threading.Lock()
 
 
-def configure_budget(*, total_games: int, lanes: int, reserve_s: float = 180.0, floor_s: float = 600.0,
+def configure_budget(*, total_games: int, lanes: int, reserve_s: float = 180.0, floor_s: float | None = None,
                      cap_s: float | None = None) -> dict:
+    if floor_s is None:
+        floor_s = _float_env("TURBO_BUDGET_FLOOR_S", 600.0)
     with _BUDGET_LOCK:
         _BUDGET.update(total=max(1, int(total_games)), lanes=max(1, int(lanes)), reserve=float(reserve_s),
                        floor=float(floor_s), cap=None if cap_s is None else float(cap_s), started=0)
