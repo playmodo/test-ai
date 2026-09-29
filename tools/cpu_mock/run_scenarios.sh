@@ -14,7 +14,7 @@ NB=$REPO/notebooks/arc3-flashnext-turbo.ipynb
 mkdir -p $OUT
 
 clean() {
-  pkill -f mock_llm_server.py 2>/dev/null; sleep 1
+  pkill -f "[m]ock_llm_server.py" 2>/dev/null; sleep 1
   rm -f /kaggle/working/vllm-* /kaggle/working/mock-llm-server.pid
 }
 
