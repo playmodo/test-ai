@@ -174,8 +174,11 @@ Các biến môi trường để thử nghiệm (đặt ở đầu cell 3):
   - **F**: prefix cache "hỏng" (trả lời sai ở đường cache-hit) → loại profile prefix.
   - Bộ phân loại OOM: kiểm thử đơn vị trên log 09-22 khoẻ mạnh (không bị coi là OOM) và các dạng OOM thật.
   - Hợp đồng watchdog (argv dựng lại khớp argv đang chạy) được kiểm tra với file identity thật.
-  - **Diễn tập nhánh nộp bài thật** (`--competition`): gateway giả chế độ competition với 110 game, 1 scorecard,
-    ngân sách thu nhỏ; kiểm tra keepalive, wave-fit, ngân sách động mỗi game, soft end và teardown.
+  - **Diễn tập nhánh nộp bài thật** (`--competition`, `KAGGLE_IS_COMPETITION_RERUN=1`): gateway giả chế độ competition
+    với 110 game, 1 scorecard, ngân sách 9 giờ thu nhỏ còn 12 phút. Kết quả trên bản cuối: keepalive chạy, profile prefix
+    qua kiểm tra ngắn + pha quá tải 20/20 + câu cold sau evict, hợp đồng watchdog ok, chính sách restart không prefix được
+    cài, 4 wave, 110/110 game có ngân sách riêng và kết thúc hợp lệ, 2421 request game ở T=1.0, teardown sạch, không cell
+    nào lỗi.
   - Cả 25 game chạy xong, không game nào crashed; audit + scorer chạy; không cell nào lỗi.
 - **Các hiệu ứng đã xác nhận trong request:** nhiệt độ 1.0; dòng đồng hồ; system prompt đã sửa (không còn "puzzle");
   `UNDO` có trong valid actions ở các game có ACTION7; dòng GAME_OVER đã sửa; F11 hoạt động.
