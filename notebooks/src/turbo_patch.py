@@ -12,13 +12,14 @@ T1  TURBO_HISTORY_KEEP (64)   The runtime-state file handed to the python sandbo
                                re-serializes it into the sandbox: ~1.7 s per action at 300 entries on one core,
                                shared by all game threads through the GIL, so long games hit the 30 s tool timeout
                                and lose the whole model call (Tufa example-run: 26-38 % tool timeouts past 200
-                               actions). Cut entries get an empty action, so `transitions` never has a None
-                               `before_frame`, and `history[0]` is the start of the current level. The solver's own
-                               in-memory history (scoring, level tracking) is untouched.
+                               actions). Up to N+1 entries the history is unchanged; beyond that the current level's
+                               start frame (when that level began before the kept tail) comes first. The first entry
+                               of each kept run gets an empty action, so `transitions` never pairs frames across a
+                               cut. The solver's own in-memory history (scoring, level tracking) is untouched.
 T2  TURBO_SANDBOX_BUILTINS    `class` statements, `object`, `super` and the common exception names (KeyError,
                                IndexError, AttributeError, ...) were missing from the sandbox, so any snippet that
                                defined a class or caught KeyError failed with NameError. Also allows the pure-stdlib
-                               dataclasses / typing / enum modules.
+                               dataclasses / typing / enum modules (and lists them in the prompt's module allowlist).
 T3  TURBO_ANALYZE_GUARD (6)   An analyzer exception (or a None result) used to mark the game `crashed` for the
                                rest of the run. Now it is retried (backoff 5 s, 10 s, ... max 30 s) up to N
                                consecutive times before falling back to the stock behaviour.
@@ -44,7 +45,8 @@ T6  per-game budget           Each game's time budget is computed when the game 
                                games that start after an early finish get the freed time.
 T7  TURBO_HALF_SWAP (auto)    Only when the serving profile has prefix caching on: when a new turn overflows the
                                context budget, trim history down to 60 % of the budget instead of dropping one block
-                               per turn, so the next few turns extend a stable, cache-hit prefix.
+                               per turn, so the next few turns extend a stable, cache-hit prefix. Checked per call, so
+                               it stops if the watchdog restarts vLLM without prefix caching.
 """
 from __future__ import annotations
 
@@ -73,8 +75,9 @@ def _float_env(key: str, default: float) -> float:
 
 # --------------------------------------------------------------------------------------------- T1 history cap
 HISTORY_NOTE_OLD = "- `history` is a chronological list of action/frame snapshots.\n"
-HISTORY_NOTE_NEW = ("- `history` is a chronological list of action/frame snapshots: the start of the current level "
-                    "followed by the most recent {keep} actions.\n")
+HISTORY_NOTE_NEW = ("- `history` is a chronological list of action/frame snapshots. In long games it keeps only the "
+                    "most recent {keep} actions, preceded by the current level's start frame when that level began "
+                    "earlier; an entry with an empty action marks where older history was cut.\n")
 
 
 def capped_entries(history: list, keep: int) -> list:
@@ -143,6 +146,7 @@ EXTRA_MODULES = ("dataclasses", "typing", "enum")  # pure-stdlib helpers models 
 BUILTINS_ANCHOR = "SAFE_BUILTINS = {\n"
 MODULES_ANCHOR = "SAFE_MODULES = {\n"
 GLOBALS_ANCHOR = '        "result": None,\n    }\n'
+MODULES_SENTENCE = "- The only importable standard-library modules are: "
 
 
 def _extend_set_literal(src: str, anchor: str, names) -> tuple[str, int]:
@@ -153,7 +157,7 @@ def _extend_set_literal(src: str, anchor: str, names) -> tuple[str, int]:
     return head + anchor + "".join(f'    "{name}",\n' for name in missing) + body + "}" + rest, len(missing)
 
 
-def _install_sandbox_builtins(sb_mod, rep: dict) -> None:
+def _install_sandbox_builtins(sb_mod, ta_mod, rep: dict) -> None:
     src = sb_mod._SANDBOX_BOOTSTRAP
     if any(src.count(anchor) != 1 for anchor in (BUILTINS_ANCHOR, MODULES_ANCHOR, GLOBALS_ANCHOR)):
         rep["T2_error"] = "anchor not found"
@@ -166,6 +170,16 @@ def _install_sandbox_builtins(sb_mod, rep: dict) -> None:
     sb_mod._SANDBOX_BOOTSTRAP = patched
     rep["T2_sandbox_builtins"] = n_builtins
     rep["T2_sandbox_modules"] = n_modules
+    # the system prompt's module allowlist (PYTHON_ADDENDUM, read by _build_system_prompt at call time) must list them
+    addendum = ta_mod.PYTHON_ADDENDUM
+    if addendum.count(MODULES_SENTENCE) != 1:
+        rep["T2_prompt_missing"] = "module allowlist sentence"
+        return
+    start = addendum.index(MODULES_SENTENCE) + len(MODULES_SENTENCE)
+    end = addendum.index(".\n", start)
+    names = sorted({name.strip() for name in addendum[start:end].split(",") if name.strip()} | set(EXTRA_MODULES))
+    ta_mod.PYTHON_ADDENDUM = addendum[:start] + ", ".join(names) + addendum[end:]
+    rep["T2_prompt_modules"] = len(names)
 
 
 # --------------------------------------------------------------------------------------------- T3 analyze guard
@@ -316,8 +330,15 @@ def clock_line(session) -> str | None:
     return line
 
 
+def _state_line(text: str) -> int | None:
+    lines = text.split("\n")
+    return next((i for i, line in enumerate(lines) if line.startswith("Current state:")), None)
+
+
 def _with_clock(messages: list, clock: str) -> list:
-    """Outgoing copy with the clock line after 'Current state:' in the newest turn prompt (never stored)."""
+    """Outgoing copy with the clock line after 'Current state:' in the newest turn prompt (never stored). Only the
+    newest message with a 'Current state:' line is ever touched: older prompts stay byte-identical (prefix cache),
+    and a clock the model copied into its carried notes cannot divert the line to an older turn."""
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if not isinstance(message, dict) or message.get("role") != "user":
@@ -328,16 +349,19 @@ def _with_clock(messages: list, clock: str) -> list:
             text = content
         elif isinstance(content, list):
             text_index = next((i for i, part in enumerate(content) if isinstance(part, dict)
-                               and part.get("type") == "text" and "Current state:" in str(part.get("text", ""))), None)
+                               and part.get("type") == "text" and _state_line(str(part.get("text", ""))) is not None),
+                              None)
             if text_index is None:
                 continue
             parts, text = content, str(content[text_index].get("text", ""))
         else:
             continue
-        if "Current state:" not in text or CLOCK_PREFIX in text:
+        at = _state_line(text)
+        if at is None:
             continue
         lines = text.split("\n")
-        at = next(i for i, line in enumerate(lines) if line.startswith("Current state:"))
+        if at + 1 < len(lines) and lines[at + 1].startswith(CLOCK_PREFIX):
+            return messages   # already clocked (a re-sent copy)
         lines.insert(at + 1, clock)
         new_text = "\n".join(lines)
         if parts is None:
@@ -542,6 +566,8 @@ def _install_half_swap(ta_mod, rep: dict) -> None:
 
     def _trim_messages_for_context(self, messages, *, tools=None, preserve_recent=1, extra_safety_tokens=0):
         try:
+            if mode == "auto" and os.environ.get("TAAF_VLLM_ENABLE_PREFIX_CACHING", "0").strip() != "1":
+                raise LookupError("prefix caching switched off (watchdog restart)")
             # only at a turn start (newest message is the fresh user prompt): a turn in flight keeps the stock
             # one-block trimming, so it can never evict its own prompt
             if (messages and len(messages) > 2 and str(messages[-1].get("role", "")) == "user"
@@ -566,7 +592,7 @@ def install(ta_mod, an_mod, solv_mod, rs_mod, sb_mod) -> dict:
     rep: dict = {"installed": True}
     steps = (
         ("T1", lambda: _install_history_cap(rs_mod, solv_mod, ta_mod, rep), "TURBO_HISTORY_CAP"),
-        ("T2", lambda: _install_sandbox_builtins(sb_mod, rep), "TURBO_SANDBOX_BUILTINS"),
+        ("T2", lambda: _install_sandbox_builtins(sb_mod, ta_mod, rep), "TURBO_SANDBOX_BUILTINS"),
         ("T3", lambda: _install_analyze_guard(ta_mod, rep), "TURBO_ANALYZE_GUARD"),
         ("T4", lambda: _install_sampling(ta_mod, rep), "TURBO_SAMPLING"),
         ("T5", lambda: _install_prompt(ta_mod, an_mod, solv_mod, rep), "TURBO_PROMPT"),

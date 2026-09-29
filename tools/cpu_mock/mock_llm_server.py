@@ -6,7 +6,15 @@ completion is a `python` tool call that plays a random valid action (or a short 
 "World model:" / "Plan:" lines, so the whole Duck loop (sandbox, action execution, memory parsing,
 history trimming, AGENTFIX/anim/sheet patches) runs end to end without a GPU. A few responses are
 deliberately degenerate (no tool call, sandbox exception, RESET) to exercise the error paths.
-Each request is logged (size, images, estimated prompt tokens, sampling params) to $MOCK_LOG.
+Each request is logged (size, images, estimated prompt tokens, sampling params, kind = game / live / load) to
+$MOCK_LOG.
+
+Failure injection (matched against TAAF_VLLM_MAX_NUM_SEQS of the profile that launched this server):
+  MOCK_FAIL_LIVE_SEQS=16             HTTP 500 on the notebook's live-check table lookups
+  MOCK_FAIL_LOAD_SEQS=16             HTTP 500 on the live check's overload phase ("Load probe" requests)
+  MOCK_CORRUPT_WARM=16               wrong answers on the cache-hit path of the live check
+  MOCK_CRASH_AFTER_GAME_REQUESTS=N   the server process dies after N game requests (a mid-run vLLM crash), unless
+                                     MOCK_NO_CRASH=1 (set by the mock start_server for the watchdog's replacement)
 """
 from __future__ import annotations
 
@@ -25,6 +33,7 @@ LOG = os.environ.get("MOCK_LOG", "/tmp/mock_llm_requests.jsonl")
 _lock = threading.Lock()
 _n = 0
 _lookups = 0
+_games = 0
 
 CODE_RANDOM = r'''
 import random
@@ -115,15 +124,30 @@ class H(BaseHTTPRequestHandler):
             _n += 1
             n = _n
         chars = _chars(msgs)
-        fail_live = [s for s in os.environ.get("MOCK_FAIL_LIVE_SEQS", "").split(",") if s]
-        if os.environ.get("TAAF_VLLM_MAX_NUM_SEQS", "") in fail_live and "Reference notes" in json.dumps(msgs)[:4000]:
-            self._send(500, {"error": "mock: simulated live-check failure"})  # e.g. a first-use crash
-            return
+        head = json.dumps(msgs)[:400]
+        kind = "live" if "Reference table" in head else "load" if "Load probe" in head else "game"
+        seqs = os.environ.get("TAAF_VLLM_MAX_NUM_SEQS", "")
+        for key, where in (("MOCK_FAIL_LIVE_SEQS", "live"), ("MOCK_FAIL_LOAD_SEQS", "load")):
+            if kind == where and seqs in [s for s in os.environ.get(key, "").split(",") if s]:
+                self._send(500, {"error": f"mock: simulated {where}-check failure"})  # e.g. a crash under load
+                return
+        if kind == "game":
+            global _games
+            with _lock:
+                _games += 1
+                games = _games
+            crash_after = int(os.environ.get("MOCK_CRASH_AFTER_GAME_REQUESTS", "0") or 0)
+            if crash_after and games > crash_after and os.environ.get("MOCK_NO_CRASH") != "1":
+                print(f"MOCK_CRASH after {crash_after} game requests", flush=True)
+                os._exit(3)   # a dead vLLM: the port closes, the watchdog sees failed health checks
         rec = {
-            "n": n, "t": time.time(), "msgs": len(msgs), "images": _count_images(msgs), "chars": chars,
+            "n": n, "t": time.time(), "kind": kind, "pid": os.getpid(),
+            "prefix": os.environ.get("TAAF_VLLM_ENABLE_PREFIX_CACHING"),
+            "msgs": len(msgs), "images": _count_images(msgs), "chars": chars,
             "est_tokens": chars // 3, "max_tokens": req.get("max_tokens"), "temperature": req.get("temperature"),
             "top_p": req.get("top_p"), "top_k": req.get("top_k"), "seed": req.get("seed"),
-            "extra": {k: req.get(k) for k in ("chat_template_kwargs", "skip_special_tokens", "priority") if k in req},
+            "extra": {k: req.get(k) for k in ("chat_template_kwargs", "skip_special_tokens", "priority", "min_tokens")
+                      if k in req},
             "tools": [t.get("function", {}).get("name") for t in req.get("tools") or []],
             "last_user_tail": "",
         }
@@ -153,6 +177,12 @@ class H(BaseHTTPRequestHandler):
                              "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop",
                                                           "message": {"role": "assistant", "content": answer}}],
                              "usage": {"prompt_tokens": len(blob) // 3, "completion_tokens": 3}})
+            return
+        if kind == "load":
+            self._send(200, {"id": f"chatcmpl-{n}", "object": "chat.completion", "created": int(time.time()),
+                             "model": MODEL, "choices": [{"index": 0, "finish_reason": "length",
+                                                          "message": {"role": "assistant", "content": "L0000"}}],
+                             "usage": {"prompt_tokens": chars // 3, "completion_tokens": 256}})
             return
         roll = random.random()
         content = (f"World model: mock world model #{n}. The board is a grid.\n"

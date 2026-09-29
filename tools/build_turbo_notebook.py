@@ -62,8 +62,9 @@ when time ran out.
 
 1. **Serving profile chain with fallback** (cells 3 and 9): MTP off (frees ~7.5 GiB of weights) and a 2-2.4x larger
    bf16 KV pool, prefix caching (mamba align mode), `max_num_seqs` matched to the pool. Each profile must start and
-   pass a live request check; otherwise it is torn down and the next one is tried, ending with the base notebook's
-   proven MTP-3 profile. `TAAF_VLLM_MAX_NUM_BATCHED_TOKENS` is no longer overridden (the override broke the
+   pass a live request check (for prefix caching also a production-shaped overload that forces preemption and cache
+   eviction); otherwise it is torn down and the next one is tried, ending with the base notebook's exact MTP-3 argv. If
+   vLLM crashes mid-run under prefix caching, the watchdog restarts it with prefix caching off. `TAAF_VLLM_MAX_NUM_BATCHED_TOKENS` is no longer overridden (the override broke the
    watchdog's restart path, so a vLLM crash stayed fatal).
 2. **Per-game time fitted to the real game count and the time left after setup** (no wave is cut by the deadline).
 3. **Agent fixes** (cell 11, `turbo_patch`): runtime-state history capped (the stock harness re-serialized the whole
@@ -115,10 +116,10 @@ TURBO_PROFILES = [
         "env": {**_TURBO_BASE_ENV, "TAAF_VLLM_MTP_TOKENS": "0", "TAAF_VLLM_KV_CACHE_MEMORY_BYTES": str(7 * 1024**3),
                 "TAAF_VLLM_MAX_NUM_SEQS": "11", "TAAF_VLLM_ENABLE_PREFIX_CACHING": "0"},
     },
-    {   # last resort: the base notebook's proven MTP-3 / 5 GiB profile (stock c8 shape: ~3.8 requests fit)
-        "name": "base-mtp3-kv5-s8", "live_check": None,
+    {   # last resort: exactly the 09-22 run's vLLM argv (MTP-3, 5 GiB, max_num_seqs 16, default batched tokens)
+        "name": "base-mtp3-kv5-s16", "live_check": None,
         "env": {**_TURBO_BASE_ENV, "TAAF_VLLM_MTP_TOKENS": "3", "TAAF_VLLM_KV_CACHE_MEMORY_BYTES": str(5 * 1024**3),
-                "TAAF_VLLM_MAX_NUM_SEQS": "8", "TAAF_VLLM_ENABLE_PREFIX_CACHING": "0"},
+                "TAAF_VLLM_MAX_NUM_SEQS": "16", "TAAF_VLLM_ENABLE_PREFIX_CACHING": "0"},
     },
 ]
 # Optional override for experiments: TURBO_PROFILE_START=<index> skips the first profiles.
@@ -171,6 +172,7 @@ import shutil as _shutil
 import signal as _signal
 import socket as _socket
 import threading as _threading
+import urllib.error as _urlerr
 import urllib.request as _urlreq
 
 _TURBO_TMP = Path("/tmp")
@@ -179,6 +181,17 @@ _TURBO_CACHE_ROOTS = [_TURBO_TMP / "qwen38-flash-next-vllm-cache", _TURBO_TMP / 
 _TURBO_SERVER_ENV_MARKERS = (b"VLLM_PLE_CPU_OFFLOAD=1\\x00", b"VLLM_RADIXARK_QWEN38_NVFP4_PLE_FP8=1\\x00")
 _TURBO_SETUP_TIMEOUT_S = float(os.environ.get("TURBO_SETUP_ATTEMPT_TIMEOUT_S", "2100"))
 _TURBO_SETUP_DEADLINE_S = float(os.environ.get("TURBO_SETUP_DEADLINE_S", "2700"))   # after this, only the proven profile
+# OOM = the fatal forms, or any other "OOM" once the harmless FlashInfer autotuner line of the healthy 09-22 log
+# ("... memory allocation failed with OOM on device 0 ...", a skipped tactic) is removed. A false positive only routes
+# to the smaller, Kaggle-proven kv7 profile; a missed OOM would skip it.
+_TURBO_OOM_RE = _re.compile(r"OutOfMemoryError|out of memory|cudaErrorMemoryAllocation|CUBLAS_STATUS_ALLOC_FAILED|"
+                            r"No available memory for the cache blocks|less than desired GPU memory utilization|\\boom\\b",
+                            _re.I)
+
+
+def _turbo_is_oom(text: str) -> bool:
+    kept = [line for line in text.splitlines() if "memory allocation failed with OOM" not in line]
+    return bool(_TURBO_OOM_RE.search("\\n".join(kept)))
 _TURBO_ENV_SNAPSHOT = dict(os.environ)
 _TURBO_SETUP_ENV_SNAPSHOT = SETUP_ENV_PATH.read_text()
 
@@ -236,10 +249,10 @@ def _turbo_ancestors() -> set:
     return pids
 
 
-def _turbo_serving_pids() -> list:
+def _turbo_serving_pids(live_only: bool = False) -> list:
     """Processes of the failed attempt: vLLM API/engine/worker processes, the PLE-offload worker and
     torch_shm_manager (the markers the bundle's serving_teardown.py uses), plus every process in the saved vLLM
-    session. Never this kernel or any of its ancestors."""
+    session. Never this kernel or any of its ancestors; with live_only, never a zombie."""
     skip = _turbo_ancestors()
     session_ids = set()
     try:
@@ -257,6 +270,8 @@ def _turbo_serving_pids() -> list:
             comm = (proc / "comm").read_text(errors="replace").strip().lower()
             cmdline = (proc / "cmdline").read_bytes().replace(b"\\x00", b" ").decode(errors="replace").lower()
         except Exception:
+            continue
+        if live_only and fields[0] == "Z":
             continue
         hit = (int(fields[2]) in session_ids or int(fields[3]) in session_ids
                or "vllm::" in comm or "vllm.entrypoints" in cmdline or "qwen38-flash-next-vllm" in cmdline
@@ -303,8 +318,9 @@ def _turbo_teardown() -> None:
 
 
 def _turbo_failure_text(attempt: int) -> str:
-    text = ""
-    for path in (WORKING_DIR / "vllm-setup-failure.json", WORKING_DIR / f"vllm-openai-server.attempt{attempt}.log"):
+    text = ""   # only this attempt's records (_turbo_release moved them aside under attempt-numbered names)
+    for path in (WORKING_DIR / f"vllm-setup-failure.attempt{attempt}.json",
+                 WORKING_DIR / f"vllm-openai-server.attempt{attempt}.log"):
         try:
             text += path.read_text(errors="replace")[-200000:]
         except Exception:
@@ -313,22 +329,31 @@ def _turbo_failure_text(attempt: int) -> str:
 
 
 def _turbo_release(attempt: int, timeout_s: float = 300.0) -> None:
-    log_path = WORKING_DIR / "vllm-openai-server.log"
-    if log_path.exists():   # start_server unlinks it; keep the failed attempt's log for diagnosis
+    _turbo_kill_serving()
+    # move the failed attempt's server log and failure record aside: kept for diagnosis, and the next attempt's
+    # fallback decision can then only ever read its own (an attempt that fails before start_server writes no log)
+    for name, archived in (("vllm-openai-server.log", f"vllm-openai-server.attempt{attempt}.log"),
+                           ("vllm-setup-failure.json", f"vllm-setup-failure.attempt{attempt}.json")):
         try:
-            _shutil.copyfile(log_path, WORKING_DIR / f"vllm-openai-server.attempt{attempt}.log")
+            (WORKING_DIR / archived).unlink(missing_ok=True)   # never a stale file from an earlier session's run
+            if (WORKING_DIR / name).exists():
+                os.replace(WORKING_DIR / name, WORKING_DIR / archived)
         except Exception:
             pass
-    _turbo_kill_serving()
-    # serving_setup's own gates need >= 64 GiB MemAvailable (PLE CPU offload), port 1234 free and 36.5 GB free /tmp
+    # serving_setup's own gates need >= 64 GiB MemAvailable (PLE CPU offload), port 1234 free, 36.5 GB free /tmp, and
+    # start_server refuses to launch while any live process of the saved server session survives
     min_mem_gib = float(os.environ.get("TURBO_RELEASE_MIN_MEM_GIB", "64"))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         used, avail = _turbo_gpu_used_mib(), _turbo_mem_available_gib()
-        if (used is None or used < 2048) and (avail is None or avail >= min_mem_gib) and not _turbo_port_open():
+        if ((used is None or used < 2048) and (avail is None or avail >= min_mem_gib) and not _turbo_port_open()
+                and not _turbo_serving_pids(live_only=True)):
             break
         time.sleep(5)
         _turbo_kill_serving()
+    survivors = _turbo_serving_pids(live_only=True)
+    if survivors:   # the identity stays: a live owned process must stay visible to start_server / teardown
+        print(f"TURBO_RELEASE_SURVIVORS attempt={attempt} pids={survivors}", flush=True)
     for root in _TURBO_RUNTIME_ROOTS:
         _shutil.rmtree(root, ignore_errors=True)
     try:
@@ -350,14 +375,78 @@ def _turbo_chat(payload: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-def _turbo_prefix_hits():
+def _turbo_metric(name: str):
     try:
         with _urlreq.urlopen("http://127.0.0.1:1234/metrics", timeout=20) as response:
             text = response.read().decode(errors="replace")
-        values = [float(m.group(1)) for m in _re.finditer(r"^vllm:prefix_cache_hits(?:_total)?(?:\\{[^}]*\\})?\\s+([0-9.eE+]+)", text, _re.M)]
+        pattern = "^" + _re.escape(name) + r"(?:_total)?(?:\\{[^}]*\\})?\\s+([0-9.eE+]+)"
+        values = [float(m.group(1)) for m in _re.finditer(pattern, text, _re.M)]
         return sum(values) if values else None
     except Exception:
         return None
+
+
+def _turbo_prefix_hits():
+    return _turbo_metric("vllm:prefix_cache_hits")
+
+
+def _turbo_healthy() -> bool:
+    try:
+        base = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+        with _urlreq.urlopen(base + "/models", timeout=30) as response:
+            return response.status == 200
+    except Exception as exc:
+        print(f"TURBO_LIVE_CHECK health failed: {exc!r}"[:300], flush=True)
+        return False
+
+
+def _turbo_load_phase(profile: dict, model: str, image_part, tokens_per_line: float) -> bool:
+    """Production-shaped overload for the prefix-caching profile: max_num_seqs+4 concurrent requests with distinct
+    ~26k-token prompts (+ the image), thinking on and the harness's sampling (T=1.0, top_p 0.95, top_k 20). Together
+    they exceed the KV pool, so the scheduler must preempt running requests and evict cached prefix blocks: the paths
+    the short check never reaches. Every request must return HTTP 200 (a 400 = this probe's own size estimate was
+    wrong, logged, not held against the server) and the server must stay healthy."""
+    count = int(profile["env"].get("TAAF_VLLM_MAX_NUM_SEQS", "16")) + 4
+    target = min(float(os.environ.get("TURBO_LOAD_PROMPT_TOKENS", "26000")), 29000.0)
+    lines = max(100, int(target / (tokens_per_line + 1.0)))   # +1: one more digit per line than the check's table
+    limit_s = float(os.environ.get("TURBO_LOAD_TIMEOUT_S", "300"))
+    results = []
+
+    def one(k: int) -> None:
+        rng = _random.Random(7000 + k)
+        text = (f"Load probe {k:02d}.\\n" + "\\n".join(f"L{i:04d}: {rng.randrange(10000, 100000)}" for i in range(lines))
+                + "\\nWhich line holds the largest code? Answer with its label.")
+        content = [{"type": "text", "text": text}] + ([image_part] if image_part is not None else [])
+        payload = {"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 256,
+                   "min_tokens": 64, "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+                   "chat_template_kwargs": {"enable_thinking": True}}
+        try:
+            usage = _turbo_chat(payload, timeout=limit_s).get("usage") or {}
+            results.append(("ok", int(usage.get("prompt_tokens") or 0)))
+        except _urlerr.HTTPError as exc:
+            results.append((f"http{exc.code}", 0))
+            print(f"TURBO_LIVE_LOAD request {k} HTTP {exc.code}: {exc.read()[:200]!r}", flush=True)
+        except Exception as exc:
+            results.append(("error", 0))
+            print(f"TURBO_LIVE_LOAD request {k} failed: {exc!r}"[:300], flush=True)
+
+    started = time.monotonic()
+    preempted_before = _turbo_metric("vllm:num_preemptions")
+    threads = [_threading.Thread(target=one, args=(k,), daemon=True) for k in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(1.0, limit_s + 30.0 - (time.monotonic() - started)))
+    healthy = _turbo_healthy()
+    preempted_after = _turbo_metric("vllm:num_preemptions")
+    statuses = [status for status, _ in results]
+    ok = healthy and len(results) == count and all(status in ("ok", "http400") for status in statuses)
+    tokens = [n for _, n in results if n]
+    print(f"TURBO_LIVE_LOAD profile={profile['name']} ok={ok} seconds={time.monotonic() - started:.1f} "
+          f"healthy={healthy} done={len(results)}/{count} statuses={sorted(set(statuses))} "
+          f"prompt_tokens={min(tokens) if tokens else None}-{max(tokens) if tokens else None} "
+          f"preemptions={preempted_before}->{preempted_after}", flush=True)
+    return ok
 
 
 def _turbo_live_check(profile: dict) -> bool:
@@ -385,6 +474,8 @@ def _turbo_live_check(profile: dict) -> bool:
     except Exception as exc:
         print(f"TURBO_LIVE_CHECK no image ({exc!r})", flush=True)
 
+    prompt_tokens = []
+
     def ask(line: int):
         content = [{"type": "text", "text": "Reference table:\\n" + table
                     + f"\\nReply with only the 5-digit code on line L{line:03d}."}]
@@ -393,7 +484,9 @@ def _turbo_live_check(profile: dict) -> bool:
         payload = {"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 400,
                    "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}
         try:
-            message = (_turbo_chat(payload, timeout=150).get("choices") or [{}])[0].get("message") or {}
+            response = _turbo_chat(payload, timeout=150)
+            prompt_tokens.append(int((response.get("usage") or {}).get("prompt_tokens") or 0))
+            message = (response.get("choices") or [{}])[0].get("message") or {}
             text = f"{message.get('content') or ''} {message.get('reasoning_content') or message.get('reasoning') or ''}"
             return True, str(codes[line]) in text
         except Exception as exc:
@@ -411,13 +504,7 @@ def _turbo_live_check(profile: dict) -> bool:
     for thread in threads:
         thread.join(max(1.0, 330.0 - (time.monotonic() - started)))
     time.sleep(10)
-    healthy = False
-    try:
-        base = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
-        with _urlreq.urlopen(base + "/models", timeout=30) as response:
-            healthy = response.status == 200
-    except Exception as exc:
-        print(f"TURBO_LIVE_CHECK health failed: {exc!r}"[:300], flush=True)
+    healthy = _turbo_healthy()
     hits_after = _turbo_prefix_hits()
     burst_ok = len(burst) == 4 and all(ok for ok, _ in burst)
     burst_right = sum(1 for _, right in burst if right)
@@ -427,6 +514,15 @@ def _turbo_live_check(profile: dict) -> bool:
     print(f"TURBO_LIVE_CHECK profile={profile['name']} ok={ok} seconds={time.monotonic() - started:.1f} healthy={healthy} "
           f"cold={cold_ok}/{cold_right} warm={warm_ok}/{warm_right} burst={len(burst)}/{burst_right} "
           f"prefix_hits={hits_before}->{hits_after}", flush=True)
+    if ok and mode == "prefix" and os.environ.get("TURBO_LIVE_LOAD", "1") != "0":
+        measured = [n for n in prompt_tokens if n > 0]
+        tokens_per_line = (min(measured) / len(codes)) if measured else 12.5
+        ok = _turbo_load_phase(profile, model, image_part, max(6.0, min(20.0, tokens_per_line)))
+        if ok:   # the table's cached blocks were evicted by the overload: the cold lookup must still come back right
+            post_ok, post_right = ask(137)
+            ok = post_ok and (post_right or not cold_right) and _turbo_healthy()
+            print(f"TURBO_LIVE_CHECK post_load profile={profile['name']} ok={ok} answer={post_ok}/{post_right}",
+                  flush=True)
     return ok
 
 
@@ -448,17 +544,21 @@ def _turbo_serving_proof() -> None:
         print(f"TURBO_SERVING_LOG unavailable: {exc!r}", flush=True)
 
 
-def _turbo_run_setup(command: str, env: dict) -> int:
+def _turbo_run_setup(command: str, env: dict, timeout_s: float) -> tuple:
     process = subprocess.Popen(command, shell=True, cwd=WORKING_DIR, env=env, start_new_session=True)
     try:
-        return process.wait(timeout=_TURBO_SETUP_TIMEOUT_S)
+        return process.wait(timeout=timeout_s), False
     except subprocess.TimeoutExpired:
-        print(f"TURBO_SETUP_TIMEOUT after {_TURBO_SETUP_TIMEOUT_S:.0f}s", flush=True)
+        print(f"TURBO_SETUP_TIMEOUT after {timeout_s:.0f}s", flush=True)
         try:
             os.killpg(process.pid, _signal.SIGKILL)
         except Exception:
             pass
-        return -9
+        try:
+            process.wait(timeout=30)
+        except Exception:
+            pass
+        return -9, True
 
 
 TURBO_SERVING = None
@@ -468,13 +568,19 @@ while _turbo_index < len(TURBO_PROFILES):
     _turbo_profile = TURBO_PROFILES[_turbo_index]
     _turbo_apply_profile(_turbo_profile)
     _turbo_t0 = time.monotonic()
-    print(f"TURBO_SERVING_TRY {_turbo_index} {_turbo_profile['name']} elapsed_s={time.time() - NOTEBOOK_START_EPOCH:.0f} "
-          f"{json.dumps(_turbo_profile['env'], sort_keys=True)}", flush=True)
+    _turbo_elapsed = time.time() - NOTEBOOK_START_EPOCH
+    # a non-final attempt may not run past the setup deadline (floor 5 min); the proven profile keeps the full limit
+    _turbo_limit = (_TURBO_SETUP_TIMEOUT_S if _turbo_index + 1 == len(TURBO_PROFILES)
+                    else min(_TURBO_SETUP_TIMEOUT_S, max(300.0, _TURBO_SETUP_DEADLINE_S - _turbo_elapsed)))
+    print(f"TURBO_SERVING_TRY {_turbo_index} {_turbo_profile['name']} elapsed_s={_turbo_elapsed:.0f} "
+          f"limit_s={_turbo_limit:.0f} {json.dumps(_turbo_profile['env'], sort_keys=True)}", flush=True)
     env = _command_env()
     _turbo_stage = "ready"
+    _turbo_timed_out = False
     for command in _turbo_setup_commands:
         print(f"taaf.kaggle: setup command: {command}", flush=True)
-        _turbo_rc = _turbo_run_setup(command, env)
+        _turbo_rc, _turbo_timed_out = _turbo_run_setup(command, env,
+                                                       max(60.0, _turbo_limit - (time.monotonic() - _turbo_t0)))
         # Re-read in case the command persisted new env keys.
         env = _command_env()
         os.environ.update(env)
@@ -496,17 +602,17 @@ while _turbo_index < len(TURBO_PROFILES):
         raise RuntimeError("Every TURBO serving profile failed to start.")
     _turbo_release(_turbo_index)
     # Next profile: a prefix-caching failure -> the next (prefix-off) profile; an OOM -> the next (smaller) one;
-    # any other failure of a prefix-off MTP-0 profile, or the setup deadline passed -> straight to the proven one.
-    _turbo_oom = bool(_re.search(r"out of memory|outofmemory|cuda error: out of memory|\\boom\\b",
-                                 _turbo_failure_text(_turbo_index), _re.I))
+    # any other failure of a prefix-off MTP-0 profile, a setup hang (more likely MTP-0-wide than prefix-specific) or
+    # the setup deadline passed -> straight to the proven one.
+    _turbo_oom = _turbo_is_oom(_turbo_failure_text(_turbo_index))
     _turbo_prefix = _turbo_profile["env"].get("TAAF_VLLM_ENABLE_PREFIX_CACHING") == "1"
     _turbo_late = time.time() - NOTEBOOK_START_EPOCH > _TURBO_SETUP_DEADLINE_S
-    if _turbo_late or not (_turbo_prefix or _turbo_oom):
+    if _turbo_late or _turbo_timed_out or not (_turbo_prefix or _turbo_oom):
         _turbo_next = len(TURBO_PROFILES) - 1
     else:
         _turbo_next = _turbo_index + 1
     print(f"TURBO_FALLBACK from={_turbo_profile['name']} stage={_turbo_stage} oom={_turbo_oom} late={_turbo_late} "
-          f"to={TURBO_PROFILES[_turbo_next]['name']}", flush=True)
+          f"timed_out={_turbo_timed_out} to={TURBO_PROFILES[_turbo_next]['name']}", flush=True)
     _turbo_index = _turbo_next
 '''
 
@@ -546,7 +652,31 @@ C16_EDITS = [
         "except Exception as _turbo_exc:\n"
         "    print(f'TURBO_WATCHDOG_CONTRACT BROKEN {_turbo_exc!r}', flush=True)\n"
         "    if not TRUE_SUBMISSION:\n"
-        "        raise\n",
+        "        raise\n"
+        "# TURBO: if vLLM dies mid-run under the prefix-caching profile, the watchdog relaunches it WITHOUT prefix caching\n"
+        "# (same KV pool; the one axis no Kaggle run has used) instead of relaunching the same argv into the same crash.\n"
+        "# restart_owned_server checks the saved argv against this environment before it calls start_server, so the\n"
+        "# switch happens inside start_server; the new identity then matches the new environment for later restarts.\n"
+        "if (os.environ.get('TAAF_VLLM_ENABLE_PREFIX_CACHING') == '1' and hasattr(vllm_watchdog_setup, 'start_server')\n"
+        "        and os.environ.get('TURBO_RESTART_NO_PREFIX', '1') != '0'):\n"
+        "    _turbo_start_server = vllm_watchdog_setup.start_server\n"
+        "\n"
+        "    def _turbo_start_server_no_prefix(model_dir, env, *args, **kwargs):\n"
+        "        if os.environ.get('TAAF_VLLM_ENABLE_PREFIX_CACHING') != '1':\n"
+        "            return _turbo_start_server(model_dir, env, *args, **kwargs)\n"
+        "        os.environ['TAAF_VLLM_ENABLE_PREFIX_CACHING'] = '0'\n"
+        "        print('TURBO_WATCHDOG_RESTART_NO_PREFIX', flush=True)\n"
+        "        try:\n"
+        "            return _turbo_start_server(model_dir, env, *args, **kwargs)\n"
+        "        except BaseException:\n"
+        "            try:   # nothing was launched with the new argv: keep the environment matching the saved identity\n"
+        "                vllm_watchdog._model_dir_from_identity(vllm_watchdog_setup, vllm_watchdog._identity(vllm_watchdog_setup))\n"
+        "            except Exception:\n"
+        "                os.environ['TAAF_VLLM_ENABLE_PREFIX_CACHING'] = '1'\n"
+        "            raise\n"
+        "\n"
+        "    vllm_watchdog_setup.start_server = _turbo_start_server_no_prefix\n"
+        "    print('TURBO_WATCHDOG_RESTART_POLICY prefix_off_on_restart', flush=True)\n",
     ),
     (   # a failed summary write must not turn a finished competition run into an error
         "    await bm.run(soft_end_time=soft_end, runtime_environment=target, minimal_diagnostics=True)\n"
@@ -602,6 +732,40 @@ C16_EDITS = [
         "    print(f'TURBO_BUDGET_CONFIG_ERROR {_turbo_exc!r}', flush=True)\n"
         "\n"
         "# Start recovery only after setup readiness and all run gates pass.\n",
+    ),
+    (   # the frozen scorer only counts a pass whose runs ALL finalized as won/gave_up/cancelled: with a crashed game
+        # it raises ValueError; keep the commit version submittable (the placeholder parquet is already written)
+        "        score_summary = evaluate_runs([WORKING_DIR])\n"
+        "        score_path = save_score_file(\n"
+        "            score_summary,\n"
+        "            run_dirs=[WORKING_DIR],\n"
+        "            output_path=WORKING_DIR / \"score.json\",\n"
+        "        )\n"
+        "        if Path(score_path) != WORKING_DIR / 'score.json' or not Path(score_path).is_file():\n"
+        "            raise RuntimeError(f'Frozen scorer did not write score.json: {score_path}.')\n"
+        "        print(\n"
+        "            f'PUBLIC25_AUDIT runs=25 actions={total_actions} score_path={score_path}',\n"
+        "            flush=True,\n"
+        "        )\n",
+        "        try:\n"
+        "            score_summary = evaluate_runs([WORKING_DIR])\n"
+        "        except ValueError as _turbo_exc:   # TURBO\n"
+        "            if not crashed:\n"
+        "                raise\n"
+        "            score_summary = None\n"
+        "            print(f'TURBO_SCORE_SKIPPED crashed={crashed} {_turbo_exc!r}', flush=True)\n"
+        "        if score_summary is not None:\n"
+        "            score_path = save_score_file(\n"
+        "                score_summary,\n"
+        "                run_dirs=[WORKING_DIR],\n"
+        "                output_path=WORKING_DIR / \"score.json\",\n"
+        "            )\n"
+        "            if Path(score_path) != WORKING_DIR / 'score.json' or not Path(score_path).is_file():\n"
+        "                raise RuntimeError(f'Frozen scorer did not write score.json: {score_path}.')\n"
+        "            print(\n"
+        "                f'PUBLIC25_AUDIT runs={len(public_runs)} actions={total_actions} score_path={score_path}',\n"
+        "                flush=True,\n"
+        "            )\n",
     ),
     (   # audit the games actually chosen (smoke subset or the full public 25)
         "        if len(public_runs) != 25 or public_run_ids != list(PUBLIC_GAME_IDS):\n",
