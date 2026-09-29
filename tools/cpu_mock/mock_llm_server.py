@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ LATENCY = float(os.environ.get("MOCK_LATENCY_S", "0.3"))
 LOG = os.environ.get("MOCK_LOG", "/tmp/mock_llm_requests.jsonl")
 _lock = threading.Lock()
 _n = 0
+_lookups = 0
 
 CODE_RANDOM = r'''
 import random
@@ -113,6 +115,10 @@ class H(BaseHTTPRequestHandler):
             _n += 1
             n = _n
         chars = _chars(msgs)
+        fail_live = [s for s in os.environ.get("MOCK_FAIL_LIVE_SEQS", "").split(",") if s]
+        if os.environ.get("TAAF_VLLM_MAX_NUM_SEQS", "") in fail_live and "Reference notes" in json.dumps(msgs)[:4000]:
+            self._send(500, {"error": "mock: simulated live-check failure"})  # e.g. a first-use crash
+            return
         rec = {
             "n": n, "t": time.time(), "msgs": len(msgs), "images": _count_images(msgs), "chars": chars,
             "est_tokens": chars // 3, "max_tokens": req.get("max_tokens"), "temperature": req.get("temperature"),
@@ -126,13 +132,28 @@ class H(BaseHTTPRequestHandler):
                 c = m.get("content")
                 if isinstance(c, list):
                     c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
-                rec["last_user_tail"] = str(c)[-1500:]
+                rec["last_user_tail"] = str(c)[-6000:]
                 break
         if n <= 3 or n % 50 == 0:
             rec["system_head"] = str(msgs[0].get("content"))[:400] if msgs else ""
         with _lock, open(LOG, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
         time.sleep(LATENCY * random.uniform(0.5, 1.5))
+        blob = json.dumps(msgs)
+        lookup = re.search(r"the 5-digit code on line (L\d{3})", blob)
+        if lookup and "Reference table" in blob:  # the notebook's live serving check: answer the table lookup
+            label = lookup.group(1)
+            found = re.search(label + r": (\d{5})", blob)
+            answer = found.group(1) if found else "00000"
+            global _lookups
+            _lookups += 1
+            if os.environ.get("MOCK_CORRUPT_WARM") == os.environ.get("TAAF_VLLM_MAX_NUM_SEQS", "?") and _lookups > 1:
+                answer = "12345"  # simulate corrupted cached state on the cache-hit path
+            self._send(200, {"id": f"chatcmpl-{n}", "object": "chat.completion", "created": int(time.time()),
+                             "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop",
+                                                          "message": {"role": "assistant", "content": answer}}],
+                             "usage": {"prompt_tokens": len(blob) // 3, "completion_tokens": 3}})
+            return
         roll = random.random()
         content = (f"World model: mock world model #{n}. The board is a grid.\n"
                    f"Goal: unknown yet.\nAction model: arrows move things.\n"

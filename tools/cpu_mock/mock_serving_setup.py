@@ -36,6 +36,10 @@ def main() -> None:
     t0 = time.monotonic()
     tuning = real.resolve_vllm_tuning()
     print("VLLM_SETUP_MODE mock", flush=True)
+    fail_seqs = [s for s in os.environ.get("MOCK_FAIL_SETUP_SEQS", "").split(",") if s]
+    if str(tuning["max_num_seqs"]) in fail_seqs:  # simulate an OOM at startup for this profile
+        print("VLLM_SETUP_FAILED mock simulated failure", flush=True)
+        raise RuntimeError(f"mock: simulated setup failure for max_num_seqs={tuning['max_num_seqs']}")
     print("MOCK_VLLM_TUNING " + json.dumps(tuning, sort_keys=True), flush=True)
     cmd = real.server_command(Path("/kaggle/input/models/mock-model"), tuning=tuning)
     print("VLLM_START_COMMAND " + json.dumps(cmd[1:]), flush=True)
